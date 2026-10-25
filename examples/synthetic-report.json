@@ -1,0 +1,206 @@
+{
+  "tool": "DroidLeak Monitor",
+  "tool_version": "2.0.0",
+  "schema_version": "2.0",
+  "capture": {
+    "name": "droidleak-synthetic-example.pcap",
+    "format": "pcap",
+    "file_size_bytes": 588,
+    "packet_count": 4,
+    "duration_seconds": 0.75
+  },
+  "summary": {
+    "packet_count": 4,
+    "capture_duration_seconds": 0.75,
+    "unique_domain_count": 2,
+    "unique_ip_count": 3,
+    "connection_count": 3,
+    "dns_query_count": 1,
+    "dns_answer_count": 1,
+    "http_request_count": 1,
+    "encrypted_or_unknown_packet_count": 1,
+    "finding_count": 3,
+    "protocols": {
+      "DNS": 2,
+      "IP": 4,
+      "TCP": 2,
+      "UDP": 2
+    },
+    "source_ips": {
+      "192.0.2.10": 3,
+      "192.0.2.53": 1
+    },
+    "destination_ips": {
+      "192.0.2.10": 1,
+      "192.0.2.53": 1,
+      "198.51.100.25": 2
+    },
+    "destination_ports": {
+      "TCP/443": 1,
+      "TCP/80": 1,
+      "UDP/53": 1,
+      "UDP/53000": 1
+    }
+  },
+  "packets_seen": 4,
+  "protocols": {
+    "DNS": 2,
+    "IP": 4,
+    "TCP": 2,
+    "UDP": 2
+  },
+  "top_endpoints": [
+    {
+      "endpoint": "192.0.2.10:53000 -> 192.0.2.53:53",
+      "packets": 1
+    },
+    {
+      "endpoint": "192.0.2.53:53 -> 192.0.2.10:53000",
+      "packets": 1
+    },
+    {
+      "endpoint": "192.0.2.10:51000 -> 198.51.100.25:80",
+      "packets": 1
+    },
+    {
+      "endpoint": "192.0.2.10:51001 -> 198.51.100.25:443",
+      "packets": 1
+    }
+  ],
+  "dns": {
+    "queries": [
+      {
+        "name": "example.test",
+        "count": 1
+      }
+    ],
+    "answers": [
+      {
+        "name": "example.test",
+        "record_type": "A",
+        "address": "203.0.113.10",
+        "count": 1
+      }
+    ]
+  },
+  "dns_queries": [
+    "example.test"
+  ],
+  "dns_answers": [
+    {
+      "name": "example.test",
+      "type": "A",
+      "address": "203.0.113.10"
+    }
+  ],
+  "connections": [
+    {
+      "protocol": "TCP",
+      "source": "192.0.2.10:51000",
+      "destination": "198.51.100.25:80",
+      "packets": 1
+    },
+    {
+      "protocol": "TCP",
+      "source": "192.0.2.10:51001",
+      "destination": "198.51.100.25:443",
+      "packets": 1
+    },
+    {
+      "protocol": "UDP",
+      "source": "192.0.2.10:53000",
+      "destination": "192.0.2.53:53",
+      "packets": 2
+    }
+  ],
+  "http": {
+    "requests": [
+      {
+        "packet_number": 3,
+        "method": "POST",
+        "host": "api.example.test",
+        "http_version": "1.1",
+        "source": "192.0.2.10:51000",
+        "destination": "198.51.100.25:80"
+      }
+    ],
+    "hosts": [
+      "api.example.test"
+    ]
+  },
+  "tls": {
+    "or_unknown_packet_count": 1,
+    "client_hello_server_names": []
+  },
+  "findings": [
+    {
+      "type": "http_authorization_header",
+      "evidence_category": "confirmed_exposure",
+      "packet_number": 3,
+      "source": "192.0.2.10:51000",
+      "destination": "198.51.100.25:80",
+      "protocol": "HTTP",
+      "encryption_status": "plaintext_http",
+      "severity": "high",
+      "confidence": "high",
+      "evidence_excerpt": "Authorization: Bearer sa…23",
+      "explanation": "An HTTP authorization value is visible in a plaintext request. The value is masked in this report.",
+      "limitations": "This finding shows bytes visible in one captured packet. The analyzer does not reassemble TCP streams or establish who controlled either endpoint."
+    },
+    {
+      "type": "plaintext_sensitive_field",
+      "evidence_category": "confirmed_exposure",
+      "packet_number": 3,
+      "source": "192.0.2.10:51000",
+      "destination": "198.51.100.25:80",
+      "protocol": "HTTP",
+      "encryption_status": "plaintext_http",
+      "severity": "high",
+      "confidence": "medium",
+      "evidence_excerpt": "password=sy…ue",
+      "explanation": "A field with a credential or token-like name and a non-empty value is visible in a plaintext HTTP request.",
+      "limitations": "This finding shows bytes visible in one captured packet. The analyzer does not reassemble TCP streams or establish who controlled either endpoint."
+    },
+    {
+      "type": "context_labelled_email",
+      "evidence_category": "potential_exposure",
+      "packet_number": 3,
+      "source": "192.0.2.10:51000",
+      "destination": "198.51.100.25:80",
+      "protocol": "HTTP",
+      "encryption_status": "plaintext_http",
+      "severity": "medium",
+      "confidence": "medium",
+      "evidence_excerpt": "email=d***@example.test",
+      "explanation": "An email-like value appears next to an email field label in a plaintext HTTP request; the analyzer cannot verify whose address it is.",
+      "limitations": "This finding shows bytes visible in one captured packet. The analyzer does not reassemble TCP streams or establish who controlled either endpoint."
+    }
+  ],
+  "finding_count": 3,
+  "findings_truncated": false,
+  "coordinate_scan_enabled": false,
+  "coordinate_findings": [],
+  "risk_assessment": {
+    "category": "confirmed_exposure",
+    "severity": "high",
+    "headline": "Sensitive-looking content is visible in plaintext HTTP.",
+    "reasoning": "At least one inspectable HTTP request contained a credential-like field, authorization header, or cookie. Values are masked; this does not prove the remote endpoint's identity or subsequent use."
+  },
+  "coverage": {
+    "capture_has_timestamps": true,
+    "packet_payload_limit_bytes": 65536,
+    "packet_stream_reassembly": false,
+    "tls_decryption": false,
+    "parsing_warning_count": 0
+  },
+  "limitations": [
+    "Only the user-supplied capture was analyzed. This tool does not capture live traffic or identify installed Android apps.",
+    "HTTPS, TLS, QUIC, VPN, and encrypted DNS payloads are not decrypted or inspected.",
+    "DNS-over-HTTPS and DNS-over-TLS can hide query names; only DNS records present in the capture are shown.",
+    "HTTP inspection is limited to recognizable request data in individual packets; TCP streams and fragmented requests are not reassembled.",
+    "At most 65536 bytes per packet are inspected, and report finding/request lists are capped.",
+    "Sensitive indicators are heuristics. A clean result does not prove that a device or app is free of data leaks.",
+    "No tracker reputation list is bundled; domain tracking classifications are not attempted.",
+    "All analysis is local. Captures and report contents are not uploaded or sent to external services."
+  ]
+}

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+report.json
+test_report.json
+broken.pcap
+broken_test.pcap

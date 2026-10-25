@@ -1,358 +1,264 @@
 #!/usr/bin/env python3
-"""DroidLeak Monitor: analisis lokal PCAP dan PCAPNG."""
+"""Command-line interface for DroidLeak Monitor."""
+
+from __future__ import annotations
 
 import argparse
 import json
-import socket
-import struct
-from collections import Counter
-from datetime import datetime, timezone
+import sys
 from pathlib import Path
+from typing import Any
+
+from droidleak_core import (
+    TOOL_NAME,
+    TOOL_VERSION,
+    CaptureError,
+    analyze_capture,
+    parse_dns_payload,
+)
+from droidleak_html import render_html_report
 
 
-def read_capture(data):
-    """Return (packets, linktypes), dengan packets berupa (frame, linktype)."""
-    packets = []
-    linktypes = []
+def parse_dns_query(payload: bytes) -> dict[str, Any] | None:
+    """Backward-compatible DNS payload parser."""
+    return parse_dns_payload(payload)
 
-    # PCAP klasik
-    formats = {
-        b"\xd4\xc3\xb2\xa1": "<",
-        b"\xa1\xb2\xc3\xd4": ">",
-        b"\x4d\x3c\xb2\xa1": "<",
-        b"\xa1\xb2\x3c\x4d": ">",
-    }
 
-    if data[:4] in formats:
-        endian = formats[data[:4]]
-        if len(data) < 24:
-            raise ValueError("Header PCAP tidak lengkap.")
+def analyze_pcap(filename: str | Path) -> dict[str, Any]:
+    """Backward-compatible entry point for programmatic callers."""
+    return analyze_capture(Path(filename))
 
-        linktype = struct.unpack(endian + "I", data[20:24])[0]
-        offset = 24
 
-        while offset < len(data):
-            if len(data) - offset < 16:
-                raise ValueError("Header paket PCAP tidak lengkap.")
-            _, _, caplen, _ = struct.unpack(
-                endian + "IIII", data[offset:offset + 16]
+def _format_counts(counts: dict[str, int]) -> str:
+    if not counts:
+        return "none observed"
+    return ", ".join(f"{key}: {value}" for key, value in counts.items())
+
+
+def _duration(value: Any) -> str:
+    if value is None:
+        return "not available"
+    return f"{value:.3f} seconds"
+
+
+def render_report(report: dict[str, Any], summary_only: bool = False) -> str:
+    """Render a concise, masked terminal report."""
+    capture = report["capture"]
+    summary = report["summary"]
+    assessment = report["risk_assessment"]
+    lines = [
+        f"{TOOL_NAME} {report['tool_version']} — local capture analysis",
+        f"Capture: {capture['name']} ({capture['format']}) · "
+        f"{capture['file_size_bytes']:,} bytes",
+        f"Duration: {_duration(capture['duration_seconds'])}",
+        f"Packets analyzed: {summary['packet_count']:,}",
+        f"Unique domains: {summary['unique_domain_count']:,} | "
+        f"IP addresses: {summary['unique_ip_count']:,} | "
+        f"Connections: {summary['connection_count']:,}",
+        f"Visible HTTP requests: {summary['http_request_count']:,} | "
+        f"Encrypted/unknown packets: {summary['encrypted_or_unknown_packet_count']:,}",
+        f"Protocol layers (counts can overlap): {_format_counts(summary['protocols'])}",
+        "Source IPs: " + _format_counts(summary["source_ips"]),
+        "Destination IPs: " + _format_counts(summary["destination_ips"]),
+        "Destination ports: " + _format_counts(summary["destination_ports"]),
+    ]
+
+    if not summary_only:
+        queries = report["dns"]["queries"]
+        answers = report["dns"]["answers"]
+        lines.append(
+            "DNS queries: "
+            + (
+                ", ".join(f"{item['name']} ({item['count']})" for item in queries[:8])
+                if queries
+                else "none observed"
             )
-            offset += 16
-            if caplen > len(data) - offset:
-                raise ValueError("Data paket PCAP terpotong.")
-            packets.append((data[offset:offset + caplen], linktype))
-            offset += caplen
-
-        return packets, [linktype]
-
-    # PCAPNG
-    if data[:4] != b"\x0a\x0d\x0d\x0a":
-        raise ValueError("Format tidak dikenal. Gunakan PCAP atau PCAPNG.")
-
-    offset = 0
-    endian = None
-    interfaces = []
-
-    while offset < len(data):
-        if len(data) - offset < 12:
-            raise ValueError("Blok PCAPNG tidak lengkap.")
-
-        # Section Header Block menentukan byte order untuk section.
-        if data[offset:offset + 4] == b"\x0a\x0d\x0d\x0a":
-            bom = data[offset + 8:offset + 12]
-            if bom == b"\x4d\x3c\x2b\x1a":
-                endian = "<"
-            elif bom == b"\x1a\x2b\x3c\x4d":
-                endian = ">"
-            else:
-                raise ValueError("Byte-order magic PCAPNG tidak valid.")
-            interfaces = []
-            block_type = 0x0A0D0D0A
-        else:
-            if endian is None:
-                raise ValueError("PCAPNG tidak memiliki Section Header.")
-            block_type = struct.unpack(
-                endian + "I", data[offset:offset + 4]
-            )[0]
-
-        block_len = struct.unpack(
-            endian + "I", data[offset + 4:offset + 8]
-        )[0]
-
-        if (block_len < 12 or block_len % 4 != 0
-                or block_len > len(data) - offset):
-            raise ValueError("Panjang blok PCAPNG tidak valid.")
-
-        trailer = struct.unpack(
-            endian + "I", data[offset + block_len - 4:offset + block_len]
-        )[0]
-        if trailer != block_len:
-            raise ValueError("Panjang blok PCAPNG tidak cocok.")
-
-        start = offset + 8
-        end = offset + block_len - 4
-
-        if block_type == 1:  # Interface Description Block
-            if end - start < 8:
-                raise ValueError("Interface Description Block tidak lengkap.")
-            linktype = struct.unpack(endian + "H", data[start:start + 2])[0]
-            interfaces.append(linktype)
-            if linktype not in linktypes:
-                linktypes.append(linktype)
-
-        elif block_type == 6:  # Enhanced Packet Block
-            if end - start < 20:
-                raise ValueError("Enhanced Packet Block tidak lengkap.")
-            interface_id, _, _, caplen, _ = struct.unpack(
-                endian + "IIIII", data[start:start + 20]
-            )
-            packet_start = start + 20
-            if caplen > end - packet_start:
-                raise ValueError("Data paket PCAPNG terpotong.")
-            if interface_id >= len(interfaces):
-                raise ValueError("ID interface PCAPNG tidak valid.")
-            packets.append((
-                data[packet_start:packet_start + caplen],
-                interfaces[interface_id],
-            ))
-
-        elif block_type == 3:  # Simple Packet Block, interface 0
-            if end - start < 4:
-                raise ValueError("Simple Packet Block tidak lengkap.")
-            if not interfaces:
-                raise ValueError("PCAPNG belum mendefinisikan interface.")
-            origlen = struct.unpack(endian + "I", data[start:start + 4])[0]
-            packet_start = start + 4
-            caplen = min(origlen, end - packet_start)
-            packets.append((
-                data[packet_start:packet_start + caplen], interfaces[0]
-            ))
-
-        offset += block_len
-
-    if not linktypes:
-        raise ValueError("PCAPNG tidak memiliki interface jaringan.")
-    return packets, linktypes
-
-
-def parse_dns_query(payload):
-    if len(payload) < 12:
-        return None
-
-    try:
-        flags, qdcount, ancount = struct.unpack("!HHH", payload[2:8])
-        is_response = bool(flags & 0x8000)
-        pos = 12
-        queries = []
-        answers = []
-
-        def read_name(data, offset):
-            labels = []
-            jumped = False
-            next_offset = offset
-            steps = 0
-
-            while offset < len(data):
-                steps += 1
-                if steps > 128:
-                    return None, next_offset
-
-                length = data[offset]
-
-                if length & 0xC0 == 0xC0:
-                    if offset + 1 >= len(data):
-                        return None, next_offset
-                    pointer = ((length & 0x3F) << 8) | data[offset + 1]
-                    if pointer >= len(data):
-                        return None, next_offset
-                    if not jumped:
-                        next_offset = offset + 2
-                    offset = pointer
-                    jumped = True
-                    continue
-
-                if length & 0xC0:
-                    return None, next_offset
-
-                offset += 1
-                if length == 0:
-                    if not jumped:
-                        next_offset = offset
-                    return ".".join(labels), next_offset
-
-                if length > 63 or offset + length > len(data):
-                    return None, next_offset
-
-                labels.append(data[offset:offset + length].decode("ascii", "replace"))
-                offset += length
-
-            return None, next_offset
-
-        for _ in range(qdcount):
-            name, next_pos = read_name(payload, pos)
-            if name is None or next_pos + 4 > len(payload):
-                return None
-
-            _, qclass = struct.unpack("!HH", payload[next_pos:next_pos + 4])
-            if qclass == 1 and name:
-                queries.append(name)
-            pos = next_pos + 4
-
-        if is_response:
-            for _ in range(ancount):
-                name, next_pos = read_name(payload, pos)
-                if name is None or next_pos + 10 > len(payload):
-                    break
-
-                rtype, rclass, _, rdlength = struct.unpack(
-                    "!HHIH", payload[next_pos:next_pos + 10]
+        )
+        lines.append(
+            "DNS A/AAAA answers: "
+            + (
+                ", ".join(
+                    f"{item['name']} {item['record_type']}={item['address']}"
+                    for item in answers[:8]
                 )
-                rstart = next_pos + 10
-                rend = rstart + rdlength
+                if answers
+                else "none observed"
+            )
+        )
 
-                if rend > len(payload):
-                    break
-
-                if rclass == 1 and rtype == 1 and rdlength == 4:
-                    answers.append({
-                        "name": name,
-                        "type": "A",
-                        "address": socket.inet_ntop(socket.AF_INET, payload[rstart:rend]),
-                    })
-                elif rclass == 1 and rtype == 28 and rdlength == 16:
-                    answers.append({
-                        "name": name,
-                        "type": "AAAA",
-                        "address": socket.inet_ntop(socket.AF_INET6, payload[rstart:rend]),
-                    })
-
-                pos = rend
-
-        return {
-            "queries": queries,
-            "answers": answers,
-            "is_response": is_response,
-        }
-    except (IndexError, struct.error, ValueError):
-        return None
-
-
-def analyze_pcap(filename):
-    path = Path(filename)
-    if not path.is_file():
-        raise ValueError(f"File tidak ditemukan: {path}")
-
-    data = path.read_bytes()
-    packets, linktypes = read_capture(data)
-
-    protocols = Counter()
-    endpoints = Counter()
-    dns_queries = set()
-    dns_answers = set()
-
-    for frame, linktype in packets:
-        # Link type 1 = Ethernet
-        if linktype != 1 or len(frame) < 14:
-            continue
-
-        ethertype = struct.unpack("!H", frame[12:14])[0]
-        pos = 14
-
-        if ethertype == 0x0800 and len(frame) >= pos + 20:
-            ihl = (frame[pos] & 15) * 4
-            if ihl < 20 or len(frame) < pos + ihl:
-                continue
-
-            proto = frame[pos + 9]
-            src = socket.inet_ntoa(frame[pos + 12:pos + 16])
-            dst = socket.inet_ntoa(frame[pos + 16:pos + 20])
-            pos += ihl
-
-            if proto == 6:
-                protocols["TCP"] += 1
-                if len(frame) >= pos + 4:
-                    sport, dport = struct.unpack("!HH", frame[pos:pos + 4])
-                    endpoints[f"{src}:{sport} -> {dst}:{dport}"] += 1
-
-            elif proto == 17:
-                protocols["UDP"] += 1
-                if len(frame) >= pos + 8:
-                    sport, dport, length, _ = struct.unpack(
-                        "!HHHH", frame[pos:pos + 8]
-                    )
-                    endpoints[f"{src}:{sport} -> {dst}:{dport}"] += 1
-                    if (sport == 53 or dport == 53) and len(frame) >= pos + 8:
-                        payload = frame[pos + 8:]
-                        dns_result = parse_dns_query(payload)
-                        if dns_result:
-                            dns_queries.update(dns_result["queries"])
-                            for answer in dns_result["answers"]:
-                                dns_answers.add(
-                                    (answer["name"], answer["type"], answer["address"])
-                                )
-
-            elif proto == 1:
-                protocols["ICMP"] += 1
-            else:
-                protocols[f"IPv4 protocol {proto}"] += 1
-
-        elif ethertype == 0x86DD:
-            protocols["IPv6 (not deeply parsed)"] += 1
+        request_entries = report["http"]["requests"]
+        if request_entries:
+            lines.append("Visible HTTP requests:")
+            for request in request_entries[:5]:
+                host = request["host"] or "host not present"
+                lines.append(
+                    f"  packet {request['packet_number']}: "
+                    f"{request['method']} {host} "
+                    f"({request['source']} -> {request['destination']})"
+                )
         else:
-            protocols["Other Ethernet"] += 1
+            lines.append("Visible HTTP requests: none observed")
 
-    return {
-        "file": path.name,
-        "analyzed_at_utc": datetime.now(timezone.utc).isoformat(),
-        "packets_seen": len(packets),
-        "capture_link_type": linktypes[0] if len(linktypes) == 1 else linktypes,
-        "protocols": dict(protocols.most_common()),
-        "top_endpoints": [
-            {"endpoint": k, "packets": v}
-            for k, v in endpoints.most_common(30)
-        ],
-        "dns_queries": sorted(dns_queries),
-        "dns_answers": [
-            {"name": name, "type": record_type, "address": address}
-            for name, record_type, address in sorted(dns_answers)
-        ],
-        "notes": [
-            "Analisis lokal terhadap file capture yang diberikan.",
-            "PCAP klasik dan blok PCAPNG EPB/SPB didukung.",
-            "Analisis paket mendalam saat ini terbatas pada Ethernet/IPv4.",
-            "IPv6 hanya dihitung, tidak dianalisis secara mendalam.",
-            "Tidak mendekripsi HTTPS/TLS atau membuktikan kebocoran data.",
-            "PCAPNG dengan format blok atau link-layer lain mungkin belum didukung.",
-        ],
-    }
+        tls_names = report["tls"]["client_hello_server_names"]
+        if tls_names:
+            names = ", ".join(
+                f"{item['server_name']} (packet {item['packet_number']})"
+                for item in tls_names[:8]
+            )
+            lines.append("TLS ClientHello server-name metadata (not decrypted): " + names)
+
+        findings = report["findings"]
+        if findings:
+            lines.append(
+                f"Sensitive-data indicators: {summary['finding_count']} "
+                "(values masked; inspect each as evidence, not proof of harm)"
+            )
+            for finding in findings[:8]:
+                lines.append(
+                    f"  {finding['severity'].upper()} {finding['evidence_category']}: "
+                    f"{finding['type']} at packet {finding['packet_number']} "
+                    f"({finding['evidence_excerpt']})"
+                )
+            if report["findings_truncated"]:
+                lines.append("  Additional findings were counted but omitted from the report.")
+        else:
+            lines.append("Sensitive-data indicators: none found in inspected bytes")
+
+        if report["coordinate_scan_enabled"]:
+            coordinate_count = len(report["coordinate_findings"])
+            lines.append(
+                f"Potential coordinate patterns (not confirmed leaks): {coordinate_count}"
+            )
+            for finding in report["coordinate_findings"][:5]:
+                lines.append(
+                    f"  packet {finding['packet_number']}: "
+                    f"{finding['latitude']}, {finding['longitude']} "
+                    f"({finding['protocol']} to {finding.get('destination') or 'unknown'}) "
+                    f"context: {finding['context']!r}"
+                )
+        else:
+            lines.append(
+                "Coordinate scan: not requested; use --find-coordinates to scan "
+                "accessible, non-encrypted packet payloads."
+            )
+
+        lines.extend(
+            [
+                f"Assessment: {assessment['headline']} "
+                f"[{assessment['category']}; severity: {assessment['severity']}]",
+                f"  {assessment['reasoning']}",
+                "Limitations:",
+            ]
+        )
+        lines.extend(f"  - {limitation}" for limitation in report["limitations"][:6])
+
+    lines.append(
+        "Privacy: analysis stays local. TLS/HTTPS/QUIC/VPN payloads are not decrypted. "
+        "A clean result does not prove the device is free of leaks."
+    )
+    return "\n".join(lines)
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="DroidLeak Monitor: analisis PCAP/PCAPNG secara lokal."
+        description=(
+            "Analyze a user-provided PCAP/PCAPNG file locally. "
+            "This is not a live traffic monitor and does not decrypt TLS."
+        ),
+        epilog=(
+            "Use only captures you are authorized to inspect. "
+            "No capture or report data is uploaded."
+        ),
     )
-    parser.add_argument("pcap", nargs="?", help="Path file PCAP atau PCAPNG")
-    parser.add_argument("--json", help="Simpan laporan ke file JSON")
     parser.add_argument(
-        "--version", action="version", version="DroidLeak Monitor 0.2.0"
+        "capture",
+        type=Path,
+        nargs="?",
+        help="PCAP or PCAPNG file to analyze",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--json",
+        dest="json_path",
+        type=Path,
+        metavar="REPORT.json",
+        help="write a machine-readable JSON report to this path",
+    )
+    parser.add_argument(
+        "--html",
+        dest="html_path",
+        type=Path,
+        metavar="REPORT.html",
+        help="write a standalone, phone-friendly HTML report to this path",
+    )
+    parser.add_argument(
+        "--find-coordinates",
+        action="store_true",
+        help="scan accessible, non-encrypted payload bytes for potential coordinate pairs",
+    )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="print only capture and network metadata in the terminal",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"{TOOL_NAME} {TOOL_VERSION}",
+    )
+    return parser
 
-    if not args.pcap:
+
+def _output_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> dict[str, Path]:
+    outputs: dict[str, Path] = {}
+    for name in ("json_path", "html_path"):
+        path = getattr(args, name)
+        if path is not None:
+            outputs[name] = path.expanduser().resolve()
+    capture_path = args.capture.expanduser().resolve()
+    if capture_path in outputs.values():
+        parser.error("report output path must not overwrite the capture file")
+    if len(set(outputs.values())) != len(outputs):
+        parser.error("JSON and HTML reports must use different output paths")
+    return outputs
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.capture is None:
         parser.print_help()
-        return
+        return 0
+    outputs = _output_paths(args, parser)
 
     try:
-        report = analyze_pcap(args.pcap)
-    except (ValueError, OSError, struct.error) as exc:
-        parser.error(str(exc))
+        report = analyze_capture(args.capture, find_coordinates=args.find_coordinates)
+    except CaptureError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
-    output = json.dumps(report, indent=2, ensure_ascii=False)
-    print(output)
-    if args.json:
-        Path(args.json).write_text(output, encoding="utf-8")
-        print(f"\nLaporan disimpan ke: {args.json}")
+    try:
+        if "json_path" in outputs:
+            json_path = outputs["json_path"]
+            json_path.parent.mkdir(parents=True, exist_ok=True)
+            json_path.write_text(
+                json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        if "html_path" in outputs:
+            html_path = outputs["html_path"]
+            html_path.parent.mkdir(parents=True, exist_ok=True)
+            html_path.write_text(render_html_report(report), encoding="utf-8")
+    except OSError as exc:
+        print(f"error: cannot write report: {exc}", file=sys.stderr)
+        return 2
+
+    print(render_report(report, summary_only=args.summary))
+    if "json_path" in outputs:
+        print(f"JSON report written to: {outputs['json_path']}")
+    if "html_path" in outputs:
+        print(f"HTML report written to: {outputs['html_path']}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

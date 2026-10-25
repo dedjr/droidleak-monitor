@@ -136,30 +136,104 @@ def read_capture(data):
 
 
 def parse_dns_query(payload):
-    if len(payload) < 17:
+    if len(payload) < 12:
         return None
+
     try:
-        flags, qdcount = struct.unpack("!HH", payload[2:6])
-        if flags & 0x8000 or qdcount < 1:
-            return None
-
+        flags, qdcount, ancount = struct.unpack("!HHH", payload[2:8])
+        is_response = bool(flags & 0x8000)
         pos = 12
-        labels = []
-        while pos < len(payload):
-            length = payload[pos]
-            pos += 1
-            if length == 0:
-                break
-            # DNS compression pointers are not supported in query names.
-            if length > 63 or pos + length > len(payload):
-                return None
-            labels.append(payload[pos:pos + length].decode("ascii", "replace"))
-            pos += length
+        queries = []
+        answers = []
 
-        if not labels or pos + 4 > len(payload):
-            return None
-        return ".".join(labels)
-    except (IndexError, struct.error):
+        def read_name(data, offset):
+            labels = []
+            jumped = False
+            next_offset = offset
+            steps = 0
+
+            while offset < len(data):
+                steps += 1
+                if steps > 128:
+                    return None, next_offset
+
+                length = data[offset]
+
+                if length & 0xC0 == 0xC0:
+                    if offset + 1 >= len(data):
+                        return None, next_offset
+                    pointer = ((length & 0x3F) << 8) | data[offset + 1]
+                    if pointer >= len(data):
+                        return None, next_offset
+                    if not jumped:
+                        next_offset = offset + 2
+                    offset = pointer
+                    jumped = True
+                    continue
+
+                if length & 0xC0:
+                    return None, next_offset
+
+                offset += 1
+                if length == 0:
+                    if not jumped:
+                        next_offset = offset
+                    return ".".join(labels), next_offset
+
+                if length > 63 or offset + length > len(data):
+                    return None, next_offset
+
+                labels.append(data[offset:offset + length].decode("ascii", "replace"))
+                offset += length
+
+            return None, next_offset
+
+        for _ in range(qdcount):
+            name, next_pos = read_name(payload, pos)
+            if name is None or next_pos + 4 > len(payload):
+                return None
+
+            _, qclass = struct.unpack("!HH", payload[next_pos:next_pos + 4])
+            if qclass == 1 and name:
+                queries.append(name)
+            pos = next_pos + 4
+
+        if is_response:
+            for _ in range(ancount):
+                name, next_pos = read_name(payload, pos)
+                if name is None or next_pos + 10 > len(payload):
+                    break
+
+                rtype, rclass, _, rdlength = struct.unpack(
+                    "!HHIH", payload[next_pos:next_pos + 10]
+                )
+                rstart = next_pos + 10
+                rend = rstart + rdlength
+
+                if rend > len(payload):
+                    break
+
+                if rclass == 1 and rtype == 1 and rdlength == 4:
+                    answers.append({
+                        "name": name,
+                        "type": "A",
+                        "address": socket.inet_ntop(socket.AF_INET, payload[rstart:rend]),
+                    })
+                elif rclass == 1 and rtype == 28 and rdlength == 16:
+                    answers.append({
+                        "name": name,
+                        "type": "AAAA",
+                        "address": socket.inet_ntop(socket.AF_INET6, payload[rstart:rend]),
+                    })
+
+                pos = rend
+
+        return {
+            "queries": queries,
+            "answers": answers,
+            "is_response": is_response,
+        }
+    except (IndexError, struct.error, ValueError):
         return None
 
 
@@ -174,6 +248,7 @@ def analyze_pcap(filename):
     protocols = Counter()
     endpoints = Counter()
     dns_queries = set()
+    dns_answers = set()
 
     for frame, linktype in packets:
         # Link type 1 = Ethernet
@@ -208,9 +283,13 @@ def analyze_pcap(filename):
                     endpoints[f"{src}:{sport} -> {dst}:{dport}"] += 1
                     if dport == 53 and len(frame) >= pos + 8:
                         payload = frame[pos + 8:]
-                        query = parse_dns_query(payload)
-                        if query:
-                            dns_queries.add(query)
+                        dns_result = parse_dns_query(payload)
+                        if dns_result:
+                            dns_queries.update(dns_result["queries"])
+                            for answer in dns_result["answers"]:
+                                dns_answers.add(
+                                    (answer["name"], answer["type"], answer["address"])
+                                )
 
             elif proto == 1:
                 protocols["ICMP"] += 1
@@ -233,6 +312,10 @@ def analyze_pcap(filename):
             for k, v in endpoints.most_common(30)
         ],
         "dns_queries": sorted(dns_queries),
+        "dns_answers": [
+            {"name": name, "type": record_type, "address": address}
+            for name, record_type, address in sorted(dns_answers)
+        ],
         "notes": [
             "Analisis lokal terhadap file capture yang diberikan.",
             "PCAP klasik dan blok PCAPNG EPB/SPB didukung.",

@@ -110,7 +110,12 @@ class DroidLeakCliTests(unittest.TestCase):
             Ether(**SYNTHETIC_ETHERNET)
             / IP(src="192.0.2.5", dst="198.51.100.8")
             / UDP(sport=53000, dport=9000)
-            / Raw(load=b"location=37.7749,-122.4194;visible")
+            / Raw(
+                load=(
+                    b"location=37.7749,-122.4194;visible;"
+                    b"password=coordinate-secret-value"
+                )
+            )
         )
         write_capture(capture, [packet])
 
@@ -124,6 +129,8 @@ class DroidLeakCliTests(unittest.TestCase):
         self.assertEqual(finding["longitude"], -122.4194)
         self.assertIn("location=", finding["context"])
         self.assertEqual(finding["finding_type"], "potential_coordinate_pattern")
+        report_text = (self.work_dir / "coords.json").read_text(encoding="utf-8")
+        self.assertNotIn("coordinate-secret-value", report_text)
 
     def test_https_payload_is_not_scanned(self) -> None:
         capture = self.work_dir / "tls-port.pcap"
@@ -169,7 +176,10 @@ class DroidLeakCliTests(unittest.TestCase):
         self.assertEqual(summary["source_ips"]["192.0.2.10"], 2)
         self.assertEqual(summary["destination_ips"]["198.51.100.25"], 1)
         self.assertEqual(summary["destination_ports"]["TCP/443"], 1)
-        self.assertEqual(report["dns_queries"], [{"name": "example.test", "count": 1}])
+        self.assertEqual(
+            report["dns"]["queries"],
+            [{"name": "example.test", "count": 1}],
+        )
 
     def test_pcapng_capture_is_supported(self) -> None:
         capture = self.work_dir / "synthetic.pcapng"

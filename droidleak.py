@@ -281,7 +281,7 @@ def analyze_pcap(filename):
                         "!HHHH", frame[pos:pos + 8]
                     )
                     endpoints[f"{src}:{sport} -> {dst}:{dport}"] += 1
-                    if dport == 53 and len(frame) >= pos + 8:
+                    if (sport == 53 or dport == 53) and len(frame) >= pos + 8:
                         payload = frame[pos + 8:]
                         dns_result = parse_dns_query(payload)
                         if dns_result:
